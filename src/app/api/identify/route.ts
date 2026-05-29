@@ -1,175 +1,169 @@
 import { NextRequest, NextResponse } from "next/server";
 import path from "path";
-import OpenAI from "openai";
+import { analyzeAudioWithHuggingFace } from "@/lib/birdnet";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// ─── File type helpers ────────────────────────────────────────────────────────
 
 function isVideoFile(filename: string, mimeType: string): boolean {
   const videoExts = [".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".3gp"];
-  const videoMimes = ["video/mp4", "video/quicktime", "video/x-msvideo", "video/webm", "video/x-matroska"];
+  const videoMimes = [
+    "video/mp4",
+    "video/quicktime",
+    "video/x-msvideo",
+    "video/webm",
+    "video/x-matroska",
+  ];
   const ext = path.extname(filename).toLowerCase();
   return videoExts.includes(ext) || videoMimes.includes(mimeType);
 }
 
 function isAudioFile(filename: string, mimeType: string): boolean {
   const audioExts = [".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a", ".wma", ".opus"];
-  const audioMimes = ["audio/mpeg", "audio/wav", "audio/ogg", "audio/flac", "audio/aac", "audio/mp4", "audio/x-wav"];
+  const audioMimes = [
+    "audio/mpeg",
+    "audio/wav",
+    "audio/ogg",
+    "audio/flac",
+    "audio/aac",
+    "audio/mp4",
+    "audio/x-wav",
+    "audio/webm",
+  ];
   const ext = path.extname(filename).toLowerCase();
   return audioExts.includes(ext) || audioMimes.some((m) => mimeType.startsWith(m));
 }
 
-function getAudioFormat(filename: string, mimeType: string): "wav" | "mp3" | "ogg" | "flac" | "m4a" | "webm" {
+function isImageFile(filename: string, mimeType: string): boolean {
+  const imageExts = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"];
+  const imageMimes = ["image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"];
   const ext = path.extname(filename).toLowerCase();
-  if (ext === ".wav") return "wav";
-  if (ext === ".mp3") return "mp3";
-  if (ext === ".ogg") return "ogg";
-  if (ext === ".flac") return "flac";
-  if (ext === ".m4a") return "m4a";
-  if (ext === ".webm") return "webm";
-  if (mimeType.includes("wav")) return "wav";
-  if (mimeType.includes("mp3") || mimeType.includes("mpeg")) return "mp3";
-  if (mimeType.includes("ogg")) return "ogg";
-  if (mimeType.includes("flac")) return "flac";
-  return "wav";
+  return imageExts.includes(ext) || imageMimes.some((m) => mimeType.startsWith(m));
 }
 
+// ─── Identification helpers ───────────────────────────────────────────────────
+
 interface BirdIdentification {
-  commonName: string | null;
+  commonName: string;
   scientificName: string | null;
   confidence: number;
   notes?: string;
 }
 
-async function identifyBirdFromAudio(
-  base64Data: string,
-  format: "wav" | "mp3" | "ogg" | "flac" | "m4a" | "webm"
-): Promise<BirdIdentification> {
+/**
+ * Try HuggingFace BirdNET for audio identification.
+ * Free — no API key required (HF_TOKEN env var optional for higher limits).
+ */
+async function tryHuggingFaceBirdNET(file: File): Promise<BirdIdentification | null> {
   try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const response = await (openai.chat.completions.create as any)({
-      model: "gpt-4o-audio-preview",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_audio",
-              input_audio: {
-                data: base64Data,
-                format: format,
-              },
-            },
-            {
-              type: "text",
-              text: 'Listen to this audio and identify any bird species you can hear. Return ONLY a JSON object with no markdown: {"common_name": "...", "scientific_name": "...", "confidence": 0.0-1.0, "notes": "..."}. If no bird is detected, return {"common_name": null, "scientific_name": null, "confidence": 0, "notes": "No bird detected"}.',
-            },
-          ],
-        },
-      ],
-      max_tokens: 300,
-    });
+    const buffer = await file.arrayBuffer();
+    const results = await analyzeAudioWithHuggingFace(buffer);
 
-    const text = response.choices[0]?.message?.content ?? "";
-    const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    return {
-      commonName: parsed.common_name || null,
-      scientificName: parsed.scientific_name || null,
-      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.7,
-      notes: parsed.notes,
-    };
+    if (results.length > 0 && results[0].confidence > 0.05) {
+      const top = results[0];
+      return {
+        commonName: top.common_name,
+        scientificName: top.scientific_name || null,
+        confidence: top.confidence,
+        notes: `Identified via BirdNET (confidence: ${Math.round(top.confidence * 100)}%)`,
+      };
+    }
+    return null;
   } catch {
-    // Fallback: transcribe with Whisper then ask GPT
-    return await identifyBirdFallback(base64Data, format);
+    return null;
   }
 }
 
-async function identifyBirdFallback(
-  base64Data: string,
-  format: string
-): Promise<BirdIdentification> {
-  // Convert base64 to buffer and use Whisper
-  const audioBuffer = Buffer.from(base64Data, "base64");
-  const audioFile = new File([audioBuffer], `audio.${format}`, { type: `audio/${format}` });
-
+/**
+ * Try iNaturalist computer vision for image identification.
+ * Free — no API key required.
+ */
+async function tryInatImage(file: File): Promise<BirdIdentification | null> {
   try {
-    const transcription = await openai.audio.transcriptions.create({
-      file: audioFile,
-      model: "whisper-1",
-      prompt: "Bird sounds, bird calls, bird song",
-    });
+    const form = new FormData();
+    form.append("image", file);
 
-    const transcribedText = transcription.text || "";
+    const res = await fetch(
+      "https://api.inaturalist.org/v1/computervision/score_image",
+      {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(20000),
+      }
+    );
 
-    // Now ask GPT to identify from description
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "user",
-          content: `Based on this audio transcription of bird sounds: "${transcribedText}", identify the bird species. 
-Return ONLY a JSON object with no markdown: {"common_name": "...", "scientific_name": "...", "confidence": 0.0-1.0, "notes": "..."}. 
-If you cannot identify a bird, return {"common_name": null, "scientific_name": null, "confidence": 0, "notes": "Could not identify"}.`,
-        },
-      ],
-      max_tokens: 200,
-    });
+    if (!res.ok) return null;
 
-    const text = response.choices[0]?.message?.content ?? "";
-    const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    return {
-      commonName: parsed.common_name || null,
-      scientificName: parsed.scientific_name || null,
-      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.5,
-      notes: parsed.notes,
-    };
+    const data = await res.json();
+    const results = data.results ?? [];
+
+    for (const result of results) {
+      const score: number = result.combined_score ?? result.score ?? 0;
+      if (score < 0.05) continue;
+
+      const taxon = result.taxon ?? {};
+      const scientificName: string = taxon.name ?? "";
+      const commonName: string =
+        taxon.preferred_common_name ?? taxon.name ?? "";
+
+      if (!scientificName && !commonName) continue;
+
+      return {
+        commonName,
+        scientificName: scientificName || null,
+        confidence: score,
+        notes: "Identified via iNaturalist computer vision",
+      };
+    }
+
+    return null;
   } catch {
-    return { commonName: null, scientificName: null, confidence: 0, notes: "Identification failed" };
+    return null;
   }
 }
 
-async function identifyBirdFromVideo(base64Data: string): Promise<BirdIdentification> {
+/**
+ * Try iNaturalist sound scoring (experimental endpoint).
+ * May not be available — fails silently.
+ */
+async function tryInatSound(file: File): Promise<BirdIdentification | null> {
   try {
-    const response = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image_url",
-              image_url: {
-                url: `data:image/jpeg;base64,${base64Data}`,
-                detail: "low",
-              },
-            },
-            {
-              type: "text",
-              text: 'What bird species do you see in this image or video frame? Return ONLY a JSON object with no markdown: {"common_name": "...", "scientific_name": "...", "confidence": 0.0-1.0, "notes": "..."}. If no bird is visible, return {"common_name": null, "scientific_name": null, "confidence": 0, "notes": "No bird visible"}.',
-            },
-          ],
-        },
-      ],
-      max_tokens: 200,
-    });
+    const form = new FormData();
+    form.append("audio", file);
 
-    const text = response.choices[0]?.message?.content ?? "";
-    const cleaned = text.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    return {
-      commonName: parsed.common_name || null,
-      scientificName: parsed.scientific_name || null,
-      confidence: typeof parsed.confidence === "number" ? parsed.confidence : 0.6,
-      notes: parsed.notes,
-    };
+    const res = await fetch(
+      "https://api.inaturalist.org/v1/computervision/score_sound",
+      {
+        method: "POST",
+        body: form,
+        signal: AbortSignal.timeout(20000),
+      }
+    );
+
+    if (!res.ok) return null;
+
+    const data = await res.json();
+    const results = data.results ?? [];
+    const top = results[0];
+
+    if (top?.taxon?.name) {
+      return {
+        commonName: top.taxon.preferred_common_name ?? top.taxon.name,
+        scientificName: top.taxon.name,
+        confidence: top.combined_score ?? 0.6,
+        notes: "Identified via iNaturalist sound scoring",
+      };
+    }
+
+    return null;
   } catch {
-    return { commonName: null, scientificName: null, confidence: 0 };
+    return null;
   }
 }
+
+// ─── Route handler ────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   try {
@@ -180,39 +174,60 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "No file uploaded" }, { status: 400 });
     }
 
-    const buffer = Buffer.from(await file.arrayBuffer());
-    const base64Data = buffer.toString("base64");
-
     const isVideo = isVideoFile(file.name, file.type);
     const isAudio = isAudioFile(file.name, file.type);
+    const isImage = isImageFile(file.name, file.type);
 
-    let result: BirdIdentification;
+    let result: BirdIdentification | null = null;
 
     if (isAudio) {
-      const format = getAudioFormat(file.name, file.type);
-      result = await identifyBirdFromAudio(base64Data, format);
+      // 1. Try HuggingFace BirdNET (best for audio)
+      result = await tryHuggingFaceBirdNET(file);
+
+      // 2. Try iNaturalist sound endpoint (experimental fallback)
+      if (!result) {
+        result = await tryInatSound(file);
+      }
     } else if (isVideo) {
-      // For video: send as image to vision model (works for video thumbnails/frames)
-      result = await identifyBirdFromVideo(base64Data);
+      // For video: try BirdNET on the audio track first
+      result = await tryHuggingFaceBirdNET(file);
+
+      // Then try iNat (will likely reject video, but worth a shot)
+      if (!result) {
+        result = await tryInatImage(file);
+      }
+    } else if (isImage) {
+      // 1. Try iNaturalist computer vision (confirmed working, free)
+      result = await tryInatImage(file);
+
+      // 2. Try HuggingFace as fallback (unlikely to work for images but try)
+      if (!result) {
+        result = await tryHuggingFaceBirdNET(file);
+      }
     } else {
-      // Try audio identification as fallback
-      result = await identifyBirdFromAudio(base64Data, "wav");
+      // Unknown type: attempt audio identification
+      result = await tryHuggingFaceBirdNET(file);
     }
 
-    if (!result.commonName) {
+    if (!result || !result.commonName) {
       return NextResponse.json(
         {
           error: "no_bird",
           message: "Hmm. We couldn't find a bird in there.",
-          suggestion: "Try a longer clip or get a little closer.",
+          suggestion:
+            isVideo || isAudio
+              ? "Try a longer clip or get closer to the bird."
+              : "Make sure the bird is clearly visible in the image.",
         },
         { status: 422 }
       );
     }
 
-    // Fetch species details
+    // Fetch species details from /api/species (uses Wikipedia + Xeno-canto — all free)
     const speciesRes = await fetch(
-      `${req.nextUrl.origin}/api/species?name=${encodeURIComponent(result.commonName)}&scientific=${encodeURIComponent(result.scientificName ?? "")}`,
+      `${req.nextUrl.origin}/api/species?name=${encodeURIComponent(
+        result.commonName
+      )}&scientific=${encodeURIComponent(result.scientificName ?? "")}`,
       { signal: AbortSignal.timeout(20000) }
     );
 
